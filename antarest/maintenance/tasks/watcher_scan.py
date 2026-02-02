@@ -15,6 +15,7 @@
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from pathlib import Path
 from typing import List
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 def _collect_studies(config: Config) -> List[StudyFolder]:
     """
-    Collect studies from all workspaces (except default).
+    Collect studies from all workspaces (except default) using parallel scanning.
 
     Args:
         config: Application configuration.
@@ -40,61 +41,119 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
     Returns:
         List of StudyFolder found in all workspaces.
     """
-    studies: List[StudyFolder] = []
-    total_dirs_scanned = 0
+    from antarest.study.storage.utils import should_ignore_folder_for_scan
+
+    # Collect all root paths to scan
+    scan_tasks: List[tuple[Path, str, List[Group], List[str], List[str]]] = []
     for name, workspace in config.storage.workspaces.items():
         if name != DEFAULT_WORKSPACE_NAME:
             path = Path(workspace.path)
             groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-            result, dirs_scanned = rec_scan_for_studies_with_count(
-                path, name, groups, workspace.filter_in, workspace.filter_out
+            scan_tasks.append((path, name, groups, workspace.filter_in, workspace.filter_out))
+
+    studies: List[StudyFolder] = []
+    total_dirs_scanned = 0
+
+    # Use a thread pool to parallelize I/O-bound scanning
+    max_workers = min(16, (os.cpu_count() or 4) * 2)
+    logger.info(f"[PROFILE] Starting parallel scan with {max_workers} workers")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for root_path, workspace, groups, filter_in, filter_out in scan_tasks:
+            result, count = _parallel_scan(
+                executor, root_path, workspace, groups, filter_in, filter_out, should_ignore_folder_for_scan
             )
             studies += result
-            total_dirs_scanned += dirs_scanned
+            total_dirs_scanned += count
+
     logger.info(f"[PROFILE] Total directories scanned: {total_dirs_scanned}")
     return studies
 
 
-def rec_scan_for_studies_with_count(
+def _parallel_scan(
+    executor: ThreadPoolExecutor,
+    root_path: Path,
+    workspace: str,
+    groups: List[Group],
+    filter_in: List[str],
+    filter_out: List[str],
+    should_ignore_fn,
+) -> tuple[List[StudyFolder], int]:
+    """
+    Scan directories in parallel using a thread pool.
+
+    Strategy: BFS with parallel processing of each level's subdirectories.
+    """
+    studies: List[StudyFolder] = []
+    dirs_scanned = 0
+
+    # Queue of directories to process: (path, depth)
+    to_process = [(root_path, 0)]
+
+    while to_process:
+        # Process current batch in parallel
+        futures = {}
+        for path, depth in to_process:
+            future = executor.submit(_scan_single_dir, path, workspace, groups, filter_in, filter_out, should_ignore_fn)
+            futures[future] = (path, depth)
+
+        to_process = []
+        for future in as_completed(futures):
+            path, depth = futures[future]
+            dirs_scanned += 1
+            try:
+                result = future.result()
+                if result is None:
+                    # Directory was ignored
+                    continue
+                if result == "study":
+                    # Found a study - don't descend further
+                    studies.append(StudyFolder(path, workspace, groups))
+                elif isinstance(result, list):
+                    # List of subdirectories to process
+                    for subdir in result:
+                        to_process.append((subdir, depth + 1))
+            except Exception as e:
+                logger.error(f"Failed to scan dir {path}", exc_info=e)
+
+    return studies, dirs_scanned
+
+
+def _scan_single_dir(
     path: Path,
     workspace: str,
     groups: List[Group],
     filter_in: List[str],
     filter_out: List[str],
-    max_depth: int | None = None,
-) -> tuple[List[StudyFolder], int]:
-    """Wrapper that counts directories scanned for profiling."""
-    from antarest.study.storage.utils import should_ignore_folder_for_scan
-
-    dirs_scanned = 1  # Count this directory
-
+    should_ignore_fn,
+) -> None | str | List[Path]:
+    """
+    Scan a single directory and return:
+    - None if directory should be ignored
+    - "study" if this is a study directory
+    - List of subdirectory paths to scan further
+    """
     try:
-        if should_ignore_folder_for_scan(path, filter_in, filter_out):
-            return [], dirs_scanned
+        if should_ignore_fn(path, filter_in, filter_out):
+            return None
 
         if (path / "study.antares").exists():
-            return [StudyFolder(path, workspace, groups)], dirs_scanned
+            return "study"
 
-        if max_depth is not None and max_depth <= 0:
-            return [], dirs_scanned
-
-        folders: List[StudyFolder] = []
+        # Collect subdirectories
+        subdirs = []
         with os.scandir(path) as entries:
             for entry in entries:
-                if entry.is_dir():
-                    child_max_depth = max_depth - 1 if max_depth is not None else None
-                    try:
-                        result, child_count = rec_scan_for_studies_with_count(
-                            Path(entry.path), workspace, groups, filter_in, filter_out, child_max_depth
-                        )
-                        folders += result
-                        dirs_scanned += child_count
-                    except Exception as e:
-                        logger.error(f"Failed to scan dir {entry.path}", exc_info=e)
-        return folders, dirs_scanned
+                try:
+                    if entry.is_dir():
+                        subdirs.append(Path(entry.path))
+                except (PermissionError, OSError):
+                    pass
+        return subdirs
+
     except Exception as e:
-        logger.error(f"Failed to scan dir {path}", exc_info=e)
-        return [], dirs_scanned
+        logger.error(f"Error scanning {path}: {e}")
+        return None
 
 
 def scan_workspaces(
