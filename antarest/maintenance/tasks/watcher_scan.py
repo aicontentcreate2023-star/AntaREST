@@ -55,7 +55,8 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
     total_dirs_scanned = 0
 
     # Use a thread pool to parallelize I/O-bound scanning
-    max_workers = min(16, (os.cpu_count() or 4) * 2)
+    # For I/O-bound NFS operations, more workers = better throughput
+    max_workers = 32
     logger.info(f"[PROFILE] Starting parallel scan with {max_workers} workers")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
