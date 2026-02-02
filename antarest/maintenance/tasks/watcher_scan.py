@@ -80,15 +80,20 @@ def _parallel_scan(
     filter_in: List[str],
     filter_out: List[str],
     should_ignore_fn,
+    max_depth: int | None = None,
 ) -> tuple[List[StudyFolder], int]:
     """
     Scan directories in parallel using a thread pool.
 
     Strategy: BFS with parallel processing of each level's subdirectories.
+
+    Args:
+        max_depth: Maximum depth to scan. None means unlimited.
     """
     studies: List[StudyFolder] = []
     dirs_scanned = 0
     dirs_ignored = 0
+    max_depth_reached = 0
 
     # Queue of directories to process: (path, depth)
     to_process = [(root_path, 0)]
@@ -103,6 +108,7 @@ def _parallel_scan(
         to_process = []
         for future in as_completed(futures):
             path, depth = futures[future]
+            max_depth_reached = max(max_depth_reached, depth)
             dirs_scanned += 1
             try:
                 result = future.result()
@@ -115,12 +121,15 @@ def _parallel_scan(
                     studies.append(StudyFolder(path, workspace, groups))
                 elif isinstance(result, list):
                     # List of subdirectories to process
-                    for subdir in result:
-                        to_process.append((subdir, depth + 1))
+                    # Check max_depth before adding children
+                    if max_depth is None or depth < max_depth:
+                        for subdir in result:
+                            to_process.append((subdir, depth + 1))
             except Exception as e:
                 logger.error(f"Failed to scan dir {path}", exc_info=e)
 
-    logger.info(f"[PROFILE] Dirs ignored by filters: {dirs_ignored}/{dirs_scanned} ({100*dirs_ignored/dirs_scanned:.1f}%)")
+    logger.info(f"[PROFILE] Dirs ignored by filters: {dirs_ignored}/{dirs_scanned} ({100*dirs_ignored/max(dirs_scanned,1):.1f}%)")
+    logger.info(f"[PROFILE] Max depth reached: {max_depth_reached}, Studies found: {len(studies)}")
     return studies, dirs_scanned
 
 
