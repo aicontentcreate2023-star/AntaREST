@@ -13,6 +13,7 @@
 """Watcher scan task for discovering studies on disk."""
 
 import logging
+import os
 import time
 from html import escape
 from pathlib import Path
@@ -25,7 +26,6 @@ from antarest.login.model import Group
 from antarest.maintenance.tasks.common import BackGroundTaskStatus, LockId, WatcherScanTaskResult
 from antarest.study.model import DEFAULT_WORKSPACE_NAME, StudyFolder
 from antarest.study.service import StudyService
-from antarest.study.storage.utils import rec_scan_for_studies
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +41,60 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
         List of StudyFolder found in all workspaces.
     """
     studies: List[StudyFolder] = []
+    total_dirs_scanned = 0
     for name, workspace in config.storage.workspaces.items():
         if name != DEFAULT_WORKSPACE_NAME:
             path = Path(workspace.path)
             groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-            studies += rec_scan_for_studies(path, name, groups, workspace.filter_in, workspace.filter_out)
+            result, dirs_scanned = rec_scan_for_studies_with_count(
+                path, name, groups, workspace.filter_in, workspace.filter_out
+            )
+            studies += result
+            total_dirs_scanned += dirs_scanned
+    logger.info(f"[PROFILE] Total directories scanned: {total_dirs_scanned}")
     return studies
+
+
+def rec_scan_for_studies_with_count(
+    path: Path,
+    workspace: str,
+    groups: List[Group],
+    filter_in: List[str],
+    filter_out: List[str],
+    max_depth: int | None = None,
+) -> tuple[List[StudyFolder], int]:
+    """Wrapper that counts directories scanned for profiling."""
+    from antarest.study.storage.utils import should_ignore_folder_for_scan
+
+    dirs_scanned = 1  # Count this directory
+
+    try:
+        if should_ignore_folder_for_scan(path, filter_in, filter_out):
+            return [], dirs_scanned
+
+        if (path / "study.antares").exists():
+            return [StudyFolder(path, workspace, groups)], dirs_scanned
+
+        if max_depth is not None and max_depth <= 0:
+            return [], dirs_scanned
+
+        folders: List[StudyFolder] = []
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    child_max_depth = max_depth - 1 if max_depth is not None else None
+                    try:
+                        result, child_count = rec_scan_for_studies_with_count(
+                            Path(entry.path), workspace, groups, filter_in, filter_out, child_max_depth
+                        )
+                        folders += result
+                        dirs_scanned += child_count
+                    except Exception as e:
+                        logger.error(f"Failed to scan dir {entry.path}", exc_info=e)
+        return folders, dirs_scanned
+    except Exception as e:
+        logger.error(f"Failed to scan dir {path}", exc_info=e)
+        return [], dirs_scanned
 
 
 def scan_workspaces(
