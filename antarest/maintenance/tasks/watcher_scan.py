@@ -56,7 +56,8 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
 
     # Use a thread pool to parallelize I/O-bound scanning
     # For I/O-bound NFS operations, more workers = better throughput
-    max_workers = 64
+    # Benchmarked: 32 workers optimal (64 workers only ~2% faster)
+    max_workers = 32
     logger.info(f"[PROFILE] Starting parallel scan with {max_workers} workers")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -87,6 +88,7 @@ def _parallel_scan(
     """
     studies: List[StudyFolder] = []
     dirs_scanned = 0
+    dirs_ignored = 0
 
     # Queue of directories to process: (path, depth)
     to_process = [(root_path, 0)]
@@ -105,7 +107,8 @@ def _parallel_scan(
             try:
                 result = future.result()
                 if result is None:
-                    # Directory was ignored
+                    # Directory was ignored by filters
+                    dirs_ignored += 1
                     continue
                 if result == "study":
                     # Found a study - don't descend further
@@ -117,6 +120,7 @@ def _parallel_scan(
             except Exception as e:
                 logger.error(f"Failed to scan dir {path}", exc_info=e)
 
+    logger.info(f"[PROFILE] Dirs ignored by filters: {dirs_ignored}/{dirs_scanned} ({100*dirs_ignored/dirs_scanned:.1f}%)")
     return studies, dirs_scanned
 
 
