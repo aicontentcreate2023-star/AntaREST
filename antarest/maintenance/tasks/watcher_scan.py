@@ -73,12 +73,16 @@ def scan_workspaces(
     try:
         with db():
             with create_lock(db.session, lock_id=LockId.WATCHER_SCAN):
+                t0 = time.time()
                 studies = _collect_studies(config)
                 studies_found = len(studies)
-                logger.info(f"Found {studies_found} studies across all workspaces")
+                t1 = time.time()
+                logger.info(f"[PROFILE] _collect_studies: {t1 - t0:.1f}s - Found {studies_found} studies")
 
                 if not dry_run:
                     study_service.sync_studies_on_disk(studies, None, True)
+                    t2 = time.time()
+                    logger.info(f"[PROFILE] sync_studies_on_disk: {t2 - t1:.1f}s")
 
     except LockNotAcquired:
         logger.warning("Could not acquire lock, another watcher scan is probably running")

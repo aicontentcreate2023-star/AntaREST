@@ -1039,9 +1039,13 @@ class StudyService:
         Returns:
 
         """
+        import time as _time
+        _t0 = _time.time()
+
         now = current_time()
         clean_up_missing_studies_threshold = now - timedelta(days=MAX_MISSING_STUDY_TIMEOUT)
         all_studies = self.repository.get_all_raw()
+        logger.info(f"[PROFILE] get_all_raw: {_time.time() - _t0:.1f}s - {len(all_studies)} studies loaded")
         if directory:
             if recursive:
                 all_studies = [raw_study for raw_study in all_studies if directory in Path(raw_study.path).parents]
@@ -1058,6 +1062,7 @@ class StudyService:
 
         # Collect study IDs to delete in batch
         studies_to_delete: list[str] = []
+        _t1 = _time.time()
 
         for study in all_studies:
             if (
@@ -1093,8 +1098,10 @@ class StudyService:
         # Batch delete all orphan studies in a single transaction
         if studies_to_delete:
             self.repository.delete(*studies_to_delete)
+        logger.info(f"[PROFILE] orphan detection loop: {_time.time() - _t1:.1f}s - {len(studies_to_delete)} to delete")
 
         # Add new studies
+        _t2 = _time.time()
         # Using a set for O(1) lookup instead of O(n) list lookup
         study_paths = {(study.workspace, study.path) for study in all_studies if study.missing is None}
         missing_studies = {(study.workspace, study.path): study for study in all_studies if study.missing is not None}
@@ -1151,6 +1158,7 @@ class StudyService:
                 existing_study = studies_by_path_workspace[(workspace, study_path)]
                 if self.storage_service.raw_study_service.update_name_and_version_from_raw_meta(existing_study):
                     self.repository.save(existing_study)
+        logger.info(f"[PROFILE] add new studies loop: {_time.time() - _t2:.1f}s")
 
     def delete_missing_studies(self) -> None:
         """
