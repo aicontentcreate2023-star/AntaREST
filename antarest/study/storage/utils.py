@@ -420,7 +420,33 @@ def is_ts_gen_tmp_dir(path: Path) -> bool:
     return path.name.startswith(TS_GEN_PREFIX) and "".join(path.suffixes[-2:]) == TS_GEN_SUFFIX and path.is_dir()
 
 
-def should_ignore_folder_for_scan(path: Path, filter_in: List[str], filter_out: List[str]) -> bool:
+def should_ignore_folder_for_scan(
+    path: Path, filter_in: List[str], filter_out: List[str], is_dir_cached: Optional[bool] = None
+) -> bool:
+    """
+    Check if a folder should be ignored during scan.
+
+    Args:
+        path: The path to check.
+        filter_in: Regex patterns for folders to include.
+        filter_out: Regex patterns for folders to exclude.
+        is_dir_cached: If provided, skip the is_dir() check (optimization for os.scandir).
+    """
+    # Use cached is_dir value if provided, otherwise check
+    is_directory = is_dir_cached if is_dir_cached is not None else path.is_dir()
+
+    # Quick check: if not a directory, ignore it
+    if not is_directory:
+        return True
+
+    # Check name filters first (no I/O)
+    name = path.name
+    if not any(re.search(regex, name) for regex in filter_in):
+        return True
+    if any(re.search(regex, name) for regex in filter_out):
+        return True
+
+    # More expensive I/O checks only if name filters passed
     if is_aw_no_scan(path):
         logger.info(f"No scan directive file found. Will skip further scan of folder {path}")
         return True
@@ -433,21 +459,18 @@ def should_ignore_folder_for_scan(path: Path, filter_in: List[str], filter_out: 
         logger.info(f"TS generation temporary folder found. Will skip further scan of folder {path}")
         return True
 
-    return not (
-        path.is_dir()
-        and any(re.search(regex, path.name) for regex in filter_in)
-        and not any(re.search(regex, path.name) for regex in filter_out)
-    )
+    return False
 
 
 def has_children(path: Path, filter_in: List[str], filter_out: List[str], show_hidden_file: bool = False) -> bool:
-    for sub_path in path.iterdir():
-        try:
-            show = show_hidden_file or not sub_path.name.startswith(".")
-            if not should_ignore_folder_for_scan(sub_path, filter_in, filter_out) and show:
-                return True
-        except (PermissionError, OSError):
-            logger.warning(f"tried to run is_non_study_folder on {sub_path} but no permission")
+    with os.scandir(path) as entries:
+        for entry in entries:
+            try:
+                show = show_hidden_file or not entry.name.startswith(".")
+                if show and not should_ignore_folder_for_scan(Path(entry.path), filter_in, filter_out, entry.is_dir()):
+                    return True
+            except (PermissionError, OSError):
+                logger.warning(f"tried to run is_non_study_folder on {entry.path} but no permission")
     return False
 
 
@@ -458,6 +481,7 @@ def rec_scan_for_studies(
     filter_in: List[str],
     filter_out: List[str],
     max_depth: Optional[int] = None,
+    _is_dir_cached: Optional[bool] = None,
 ) -> List[StudyFolder]:
     """
     Recursively scan a directory for studies.
@@ -471,12 +495,13 @@ def rec_scan_for_studies(
         filter_in: Regex patterns for folders to include.
         filter_out: Regex patterns for folders to exclude.
         max_depth: Maximum depth to scan. None means unlimited.
+        _is_dir_cached: Internal param - cached is_dir result from os.scandir().
 
     Returns:
         A list of StudyFolder objects representing found studies.
     """
     try:
-        if should_ignore_folder_for_scan(path, filter_in, filter_out):
+        if should_ignore_folder_for_scan(path, filter_in, filter_out, is_dir_cached=_is_dir_cached):
             return []
 
         if (path / "study.antares").exists():
@@ -488,13 +513,25 @@ def rec_scan_for_studies(
             return []
 
         folders: List[StudyFolder] = []
-        if path.is_dir():
-            for child in path.iterdir():
+        # Use os.scandir() for better performance - DirEntry caches is_dir() result
+        with os.scandir(path) as entries:
+            for entry in entries:
                 child_max_depth = max_depth - 1 if max_depth is not None else None
                 try:
-                    folders += rec_scan_for_studies(child, workspace, groups, filter_in, filter_out, child_max_depth)
+                    # entry.is_dir() uses cached stat info from scandir (no extra syscall)
+                    child_is_dir = entry.is_dir()
+                    if child_is_dir:
+                        folders += rec_scan_for_studies(
+                            Path(entry.path),
+                            workspace,
+                            groups,
+                            filter_in,
+                            filter_out,
+                            child_max_depth,
+                            _is_dir_cached=child_is_dir,
+                        )
                 except Exception as e:
-                    logger.error(f"Failed to scan dir {child}", exc_info=e)
+                    logger.error(f"Failed to scan dir {entry.path}", exc_info=e)
         return folders
     except Exception as e:
         logger.error(f"Failed to scan dir {path}", exc_info=e)

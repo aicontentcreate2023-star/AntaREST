@@ -1040,6 +1040,7 @@ class StudyService:
 
         """
         import time as _time
+
         _t0 = _time.time()
 
         now = current_time()
