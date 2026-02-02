@@ -27,6 +27,7 @@ from antarest.login.model import Group
 from antarest.maintenance.tasks.common import BackGroundTaskStatus, LockId, WatcherScanTaskResult
 from antarest.study.model import DEFAULT_WORKSPACE_NAME, StudyFolder
 from antarest.study.service import StudyService
+from antarest.study.storage.utils import should_ignore_folder_for_scan
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,6 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
     Returns:
         List of StudyFolder found in all workspaces.
     """
-    from antarest.study.storage.utils import should_ignore_folder_for_scan
-
-    # Collect all root paths to scan
     scan_tasks: List[tuple[Path, str, List[Group], List[str], List[str]]] = []
     for name, workspace in config.storage.workspaces.items():
         if name != DEFAULT_WORKSPACE_NAME:
