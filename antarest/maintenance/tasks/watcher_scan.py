@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from pathlib import Path
-from typing import List
+from typing import Callable, List
 
 from antarest.core.config import Config
 from antarest.core.utils.fastapi_sqlalchemy import db
@@ -52,23 +52,16 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
             scan_tasks.append((path, name, groups, workspace.filter_in, workspace.filter_out))
 
     studies: List[StudyFolder] = []
-    total_dirs_scanned = 0
 
-    # Use a thread pool to parallelize I/O-bound scanning
-    # For I/O-bound NFS operations, more workers = better throughput
-    # Benchmarked: 32 workers optimal (64 workers only ~2% faster)
     max_workers = 32
-    logger.info(f"[PROFILE] Starting parallel scan with {max_workers} workers")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for root_path, workspace, groups, filter_in, filter_out in scan_tasks:
-            result, count = _parallel_scan(
-                executor, root_path, workspace, groups, filter_in, filter_out, should_ignore_folder_for_scan
+        for root_path, workspace_name, groups, filter_in, filter_out in scan_tasks:
+            result = _parallel_scan(
+                executor, root_path, workspace_name, groups, filter_in, filter_out, should_ignore_folder_for_scan
             )
             studies += result
-            total_dirs_scanned += count
 
-    logger.info(f"[PROFILE] Total directories scanned: {total_dirs_scanned}")
     return studies
 
 
@@ -79,9 +72,9 @@ def _parallel_scan(
     groups: List[Group],
     filter_in: List[str],
     filter_out: List[str],
-    should_ignore_fn,
+    should_ignore_fn: Callable[[Path, List[str], List[str]], bool],
     max_depth: int | None = None,
-) -> tuple[List[StudyFolder], int]:
+) -> List[StudyFolder]:
     """
     Scan directories in parallel using a thread pool.
 
@@ -91,9 +84,6 @@ def _parallel_scan(
         max_depth: Maximum depth to scan. None means unlimited.
     """
     studies: List[StudyFolder] = []
-    dirs_scanned = 0
-    dirs_ignored = 0
-    max_depth_reached = 0
 
     # Queue of directories to process: (path, depth)
     to_process = [(root_path, 0)]
@@ -102,19 +92,16 @@ def _parallel_scan(
         # Process current batch in parallel
         futures = {}
         for path, depth in to_process:
-            future = executor.submit(_scan_single_dir, path, workspace, groups, filter_in, filter_out, should_ignore_fn)
+            future = executor.submit(_scan_single_dir, path, filter_in, filter_out, should_ignore_fn)
             futures[future] = (path, depth)
 
         to_process = []
         for future in as_completed(futures):
             path, depth = futures[future]
-            max_depth_reached = max(max_depth_reached, depth)
-            dirs_scanned += 1
             try:
                 result = future.result()
                 if result is None:
                     # Directory was ignored by filters
-                    dirs_ignored += 1
                     continue
                 if result == "study":
                     # Found a study - don't descend further
@@ -128,18 +115,14 @@ def _parallel_scan(
             except Exception as e:
                 logger.error(f"Failed to scan dir {path}", exc_info=e)
 
-    logger.info(f"[PROFILE] Dirs ignored by filters: {dirs_ignored}/{dirs_scanned} ({100*dirs_ignored/max(dirs_scanned,1):.1f}%)")
-    logger.info(f"[PROFILE] Max depth reached: {max_depth_reached}, Studies found: {len(studies)}")
-    return studies, dirs_scanned
+    return studies
 
 
 def _scan_single_dir(
     path: Path,
-    workspace: str,
-    groups: List[Group],
     filter_in: List[str],
     filter_out: List[str],
-    should_ignore_fn,
+    should_ignore_fn: Callable[[Path, List[str], List[str]], bool],
 ) -> None | str | List[Path]:
     """
     Scan a single directory and return:
@@ -194,16 +177,12 @@ def scan_workspaces(
     try:
         with db():
             with create_lock(db.session, lock_id=LockId.WATCHER_SCAN):
-                t0 = time.time()
                 studies = _collect_studies(config)
                 studies_found = len(studies)
-                t1 = time.time()
-                logger.info(f"[PROFILE] _collect_studies: {t1 - t0:.1f}s - Found {studies_found} studies")
+                logger.info(f"Found {studies_found} studies across all workspaces")
 
                 if not dry_run:
                     study_service.sync_studies_on_disk(studies, None, True)
-                    t2 = time.time()
-                    logger.info(f"[PROFILE] sync_studies_on_disk: {t2 - t1:.1f}s")
 
     except LockNotAcquired:
         logger.warning("Could not acquire lock, another watcher scan is probably running")
