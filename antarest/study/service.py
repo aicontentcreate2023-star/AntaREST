@@ -1053,7 +1053,11 @@ class StudyService:
 
         # delete orphan studies on database
         # key should be workspace, path to sync correctly studies with same path in different workspace
-        workspace_paths = [(f.workspace, str(f.path)) for f in folders]
+        # Using a set for O(1) lookup instead of O(n) list lookup
+        workspace_paths = {(f.workspace, str(f.path)) for f in folders}
+
+        # Collect study IDs to delete in batch
+        studies_to_delete: list[str] = []
 
         for study in all_studies:
             if (
@@ -1084,10 +1088,15 @@ class StudyService:
                         study.id,
                         study.path,
                     )
-                    self.repository.delete(study.id)
+                    studies_to_delete.append(study.id)
+
+        # Batch delete all orphan studies in a single transaction
+        if studies_to_delete:
+            self.repository.delete(*studies_to_delete)
 
         # Add new studies
-        study_paths = [(study.workspace, study.path) for study in all_studies if study.missing is None]
+        # Using a set for O(1) lookup instead of O(n) list lookup
+        study_paths = {(study.workspace, study.path) for study in all_studies if study.missing is None}
         missing_studies = {(study.workspace, study.path): study for study in all_studies if study.missing is not None}
         for folder in folders:
             study_path = str(folder.path)
