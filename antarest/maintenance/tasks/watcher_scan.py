@@ -16,10 +16,9 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from pathlib import Path
-from queue import Queue
 from typing import List
 
 from antarest.core.config import Config
@@ -35,11 +34,12 @@ logger = logging.getLogger(__name__)
 
 def _collect_studies(config: Config) -> List[StudyFolder]:
     """
-    Collect studies from all workspaces (except default) using parallel scanning.
+    Collect studies from all workspaces using parallel os.walk per subtree.
 
-    Uses a queue-based approach: completed scans immediately submit discovered
-    subdirectories for processing, avoiding BFS level-synchronization barriers.
-    All workspaces are scanned concurrently from the start.
+    Strategy:
+    1. Scan workspace roots to find first-level subdirectories
+    2. Pre-filter subdirectories by name
+    3. Distribute filtered subtrees across threads, each running os.walk
     """
     scan_tasks: List[tuple[Path, str, List[Group], List[re.Pattern], List[re.Pattern]]] = []
     for name, workspace in config.storage.workspaces.items():
@@ -50,35 +50,32 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
             compiled_out = [re.compile(r) for r in workspace.filter_out]
             scan_tasks.append((path, name, groups, compiled_in, compiled_out))
 
+    # Phase 1: Scan workspace roots to collect first-level subdirectories
+    subtree_tasks: list[tuple[Path, str, list[Group], list[re.Pattern], list[re.Pattern]]] = []
     studies: List[StudyFolder] = []
-    results_queue: Queue = Queue()
-    outstanding = 0
 
+    for root_path, ws_name, groups, c_in, c_out in scan_tasks:
+        root_result = _scan_single_dir(root_path, c_in, c_out)
+        if root_result == "study":
+            studies.append(StudyFolder(root_path, ws_name, groups))
+        elif isinstance(root_result, list):
+            for subdir in root_result:
+                if _should_descend(subdir.name, c_in, c_out):
+                    subtree_tasks.append((subdir, ws_name, groups, c_in, c_out))
+
+    # Phase 2: Parallel os.walk on each first-level subtree
     with ThreadPoolExecutor(max_workers=32) as executor:
-        # Submit all workspace roots in parallel (no sequential waiting)
-        for root_path, workspace_name, groups, compiled_in, compiled_out in scan_tasks:
-            future = executor.submit(_scan_single_dir, root_path, compiled_in, compiled_out)
-            metadata = (root_path, workspace_name, groups, compiled_in, compiled_out)
-            future.add_done_callback(lambda f, m=metadata: results_queue.put((f, m)))
-            outstanding += 1
-
-        # Process results as they arrive, submitting new work immediately
-        while outstanding > 0:
-            done_future, (dir_path, ws_name, grps, c_in, c_out) = results_queue.get()
-            outstanding -= 1
-
+        futures = {
+            executor.submit(_walk_subtree, subdir, c_in, c_out): (ws_name, groups)
+            for subdir, ws_name, groups, c_in, c_out in subtree_tasks
+        }
+        for future in as_completed(futures):
+            ws_name, groups = futures[future]
             try:
-                result = done_future.result()
-                if result == "study":
-                    studies.append(StudyFolder(dir_path, ws_name, grps))
-                elif isinstance(result, list):
-                    for subdir in result:
-                        f = executor.submit(_scan_single_dir, subdir, c_in, c_out)
-                        meta = (subdir, ws_name, grps, c_in, c_out)
-                        f.add_done_callback(lambda f2, m=meta: results_queue.put((f2, m)))
-                        outstanding += 1
+                for study_path in future.result():
+                    studies.append(StudyFolder(study_path, ws_name, groups))
             except Exception as e:
-                logger.error(f"Failed to scan dir {dir_path}", exc_info=e)
+                logger.error("Failed to scan subtree", exc_info=e)
 
     return studies
 
@@ -89,27 +86,22 @@ def _scan_single_dir(
     compiled_filter_out: List[re.Pattern],
 ) -> None | str | List[Path]:
     """
-    Scan a single directory and return:
-    - None if directory should be ignored
-    - "study" if this is a study directory
-    - List of subdirectory paths to scan further
+    Scan a single directory in a single os.scandir() pass.
+    Returns None (ignored), "study" (found), or list of subdirectory Paths.
     """
     try:
         name = path.name
 
-        # Name-based checks first (no I/O)
         if not any(p.search(name) for p in compiled_filter_in):
             return None
         if any(p.search(name) for p in compiled_filter_out):
             return None
 
-        # Skip temporary dirs by name (we already know it's a dir from parent's scandir)
-        if name.startswith("~"):
-            suffixes = "".join(path.suffixes[-2:])
-            if suffixes in (".thermal_timeseries_gen.tmp", ".upgrade.tmp"):
-                return None
+        if name.startswith("~") and (
+            name.endswith(".thermal_timeseries_gen.tmp") or name.endswith(".upgrade.tmp")
+        ):
+            return None
 
-        # Single os.scandir() pass: detect markers AND collect subdirs
         subdirs = []
         with os.scandir(path) as entries:
             for entry in entries:
@@ -127,6 +119,65 @@ def _scan_single_dir(
     except Exception as e:
         logger.error(f"Error scanning {path}: {e}")
         return None
+
+
+def _walk_subtree(
+    root: Path,
+    compiled_filter_in: List[re.Pattern],
+    compiled_filter_out: List[re.Pattern],
+) -> List[Path]:
+    """
+    Walk a subtree using os.walk. Marker files (study.antares, AW_NO_SCAN)
+    are detected from the filenames list — no extra I/O, already listed
+    by os.walk's internal scandir call.
+    """
+    studies: List[Path] = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dir_name = os.path.basename(dirpath)
+
+        if not any(p.search(dir_name) for p in compiled_filter_in):
+            dirnames.clear()
+            continue
+        if any(p.search(dir_name) for p in compiled_filter_out):
+            dirnames.clear()
+            continue
+        if dir_name.startswith("~") and (
+            dir_name.endswith(".thermal_timeseries_gen.tmp")
+            or dir_name.endswith(".upgrade.tmp")
+        ):
+            dirnames.clear()
+            continue
+
+        if "AW_NO_SCAN" in filenames:
+            dirnames.clear()
+            continue
+        if "study.antares" in filenames:
+            studies.append(Path(dirpath))
+            dirnames.clear()
+            continue
+
+        # Pre-prune: filter dirnames before os.walk descends into them
+        dirnames[:] = [d for d in dirnames if _should_descend(d, compiled_filter_in, compiled_filter_out)]
+
+    return studies
+
+
+def _should_descend(
+    name: str,
+    compiled_filter_in: List[re.Pattern],
+    compiled_filter_out: List[re.Pattern],
+) -> bool:
+    """Check if a subdirectory should be descended into based on name filters."""
+    if not any(p.search(name) for p in compiled_filter_in):
+        return False
+    if any(p.search(name) for p in compiled_filter_out):
+        return False
+    if name.startswith("~") and (
+        name.endswith(".thermal_timeseries_gen.tmp") or name.endswith(".upgrade.tmp")
+    ):
+        return False
+    return True
 
 
 def scan_workspaces(
