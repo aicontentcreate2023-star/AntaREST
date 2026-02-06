@@ -14,11 +14,13 @@
 
 import logging
 import os
+import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from html import escape
 from pathlib import Path
-from typing import Callable, List
+from queue import Queue
+from typing import List
 
 from antarest.core.config import Config
 from antarest.core.utils.fastapi_sqlalchemy import db
@@ -27,7 +29,6 @@ from antarest.login.model import Group
 from antarest.maintenance.tasks.common import BackGroundTaskStatus, LockId, WatcherScanTaskResult
 from antarest.study.model import DEFAULT_WORKSPACE_NAME, StudyFolder
 from antarest.study.service import StudyService
-from antarest.study.storage.utils import should_ignore_folder_for_scan
 
 logger = logging.getLogger(__name__)
 
@@ -36,91 +37,56 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
     """
     Collect studies from all workspaces (except default) using parallel scanning.
 
-    Args:
-        config: Application configuration.
-
-    Returns:
-        List of StudyFolder found in all workspaces.
+    Uses a queue-based approach: completed scans immediately submit discovered
+    subdirectories for processing, avoiding BFS level-synchronization barriers.
+    All workspaces are scanned concurrently from the start.
     """
-    scan_tasks: List[tuple[Path, str, List[Group], List[str], List[str]]] = []
+    scan_tasks: List[tuple[Path, str, List[Group], List[re.Pattern], List[re.Pattern]]] = []
     for name, workspace in config.storage.workspaces.items():
         if name != DEFAULT_WORKSPACE_NAME:
             path = Path(workspace.path)
             groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-            scan_tasks.append((path, name, groups, workspace.filter_in, workspace.filter_out))
+            compiled_in = [re.compile(r) for r in workspace.filter_in]
+            compiled_out = [re.compile(r) for r in workspace.filter_out]
+            scan_tasks.append((path, name, groups, compiled_in, compiled_out))
 
     studies: List[StudyFolder] = []
+    results_queue: Queue = Queue()
+    outstanding = 0
 
-    max_workers = 32
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        # Submit all workspace roots in parallel (no sequential waiting)
+        for root_path, workspace_name, groups, compiled_in, compiled_out in scan_tasks:
+            future = executor.submit(_scan_single_dir, root_path, compiled_in, compiled_out)
+            metadata = (root_path, workspace_name, groups, compiled_in, compiled_out)
+            future.add_done_callback(lambda f, m=metadata: results_queue.put((f, m)))
+            outstanding += 1
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for root_path, workspace_name, groups, filter_in, filter_out in scan_tasks:
-            result = _parallel_scan(
-                executor, root_path, workspace_name, groups, filter_in, filter_out, should_ignore_folder_for_scan
-            )
-            studies += result
+        # Process results as they arrive, submitting new work immediately
+        while outstanding > 0:
+            done_future, (dir_path, ws_name, grps, c_in, c_out) = results_queue.get()
+            outstanding -= 1
 
-    return studies
-
-
-def _parallel_scan(
-    executor: ThreadPoolExecutor,
-    root_path: Path,
-    workspace: str,
-    groups: List[Group],
-    filter_in: List[str],
-    filter_out: List[str],
-    should_ignore_fn: Callable[[Path, List[str], List[str]], bool],
-    max_depth: int | None = None,
-) -> List[StudyFolder]:
-    """
-    Scan directories in parallel using a thread pool.
-
-    Strategy: BFS with parallel processing of each level's subdirectories.
-
-    Args:
-        max_depth: Maximum depth to scan. None means unlimited.
-    """
-    studies: List[StudyFolder] = []
-
-    # Queue of directories to process: (path, depth)
-    to_process = [(root_path, 0)]
-
-    while to_process:
-        # Process current batch in parallel
-        futures = {}
-        for path, depth in to_process:
-            future = executor.submit(_scan_single_dir, path, filter_in, filter_out, should_ignore_fn)
-            futures[future] = (path, depth)
-
-        to_process = []
-        for future in as_completed(futures):
-            path, depth = futures[future]
             try:
-                result = future.result()
-                if result is None:
-                    # Directory was ignored by filters
-                    continue
+                result = done_future.result()
                 if result == "study":
-                    # Found a study - don't descend further
-                    studies.append(StudyFolder(path, workspace, groups))
+                    studies.append(StudyFolder(dir_path, ws_name, grps))
                 elif isinstance(result, list):
-                    # List of subdirectories to process
-                    # Check max_depth before adding children
-                    if max_depth is None or depth < max_depth:
-                        for subdir in result:
-                            to_process.append((subdir, depth + 1))
+                    for subdir in result:
+                        f = executor.submit(_scan_single_dir, subdir, c_in, c_out)
+                        meta = (subdir, ws_name, grps, c_in, c_out)
+                        f.add_done_callback(lambda f2, m=meta: results_queue.put((f2, m)))
+                        outstanding += 1
             except Exception as e:
-                logger.error(f"Failed to scan dir {path}", exc_info=e)
+                logger.error(f"Failed to scan dir {dir_path}", exc_info=e)
 
     return studies
 
 
 def _scan_single_dir(
     path: Path,
-    filter_in: List[str],
-    filter_out: List[str],
-    should_ignore_fn: Callable[[Path, List[str], List[str]], bool],
+    compiled_filter_in: List[re.Pattern],
+    compiled_filter_out: List[re.Pattern],
 ) -> None | str | List[Path]:
     """
     Scan a single directory and return:
@@ -129,16 +95,28 @@ def _scan_single_dir(
     - List of subdirectory paths to scan further
     """
     try:
-        if should_ignore_fn(path, filter_in, filter_out):
+        name = path.name
+
+        # Name-based checks first (no I/O)
+        if not any(p.search(name) for p in compiled_filter_in):
+            return None
+        if any(p.search(name) for p in compiled_filter_out):
             return None
 
-        if (path / "study.antares").exists():
-            return "study"
+        # Skip temporary dirs by name (we already know it's a dir from parent's scandir)
+        if name.startswith("~"):
+            suffixes = "".join(path.suffixes[-2:])
+            if suffixes in (".thermal_timeseries_gen.tmp", ".upgrade.tmp"):
+                return None
 
-        # Collect subdirectories
+        # Single os.scandir() pass: detect markers AND collect subdirs
         subdirs = []
         with os.scandir(path) as entries:
             for entry in entries:
+                if entry.name == "study.antares":
+                    return "study"
+                if entry.name == "AW_NO_SCAN":
+                    return None
                 try:
                     if entry.is_dir():
                         subdirs.append(Path(entry.path))
