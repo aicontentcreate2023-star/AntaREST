@@ -10,12 +10,17 @@
 #
 # This file is part of the Antares project.
 
-"""Watcher scan task for discovering studies on disk."""
+"""Watcher scan task for discovering studies on disk.
+
+Uses queue-based parallel scanning with mtime caching for incremental scans.
+On the first invocation, every directory is fully scanned with os.scandir().
+On subsequent invocations, only directories whose mtime has changed are
+re-scanned; others return their cached result via a cheap os.stat() call.
+"""
 
 import logging
 import os
 import re
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
@@ -33,118 +38,17 @@ from antarest.study.service import StudyService
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Incremental mtime cache
+# ---------------------------------------------------------------------------
+# Maps directory path (str) -> (mtime_ns, scan_result)
+# scan_result is: None (filtered/ignored), "study", or list of subdirectory
+# path strings.  Thread-safe under CPython GIL (dict __setitem__/__getitem__).
+_dir_cache: dict[str, tuple[int, None | str | list[str]]] = {}
+
 
 def _collect_studies(config: Config) -> List[StudyFolder]:
-    """
-    Collect studies using GNU find for C-native filesystem traversal,
-    with post-filtering in Python. Falls back to Python-based scanning
-    if find is unavailable.
-    """
-    workspace_roots: list[str] = []
-    workspace_map: dict[str, tuple[str, list[Group], list[re.Pattern], list[re.Pattern]]] = {}
-
-    for name, workspace in config.storage.workspaces.items():
-        if name != DEFAULT_WORKSPACE_NAME:
-            root_path = Path(workspace.path)
-            groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-            compiled_in = [re.compile(r) for r in workspace.filter_in]
-            compiled_out = [re.compile(r) for r in workspace.filter_out]
-
-            # Check root name against filters (same as original behavior)
-            root_name = root_path.name
-            if not any(p.search(root_name) for p in compiled_in):
-                continue
-            if any(p.search(root_name) for p in compiled_out):
-                continue
-
-            root_str = str(root_path)
-            workspace_roots.append(root_str)
-            workspace_map[root_str] = (name, groups, compiled_in, compiled_out)
-
-    if not workspace_roots:
-        return []
-
-    # Single find command: C-native traversal, prune temp dirs, tag output
-    # fmt: off
-    cmd = ["find"] + workspace_roots + [
-        "(", "-name", "~*.thermal_timeseries_gen.tmp", "-type", "d", "-prune", ")",
-        "-o",
-        "(", "-name", "~*.upgrade.tmp", "-type", "d", "-prune", ")",
-        "-o",
-        "(", "-name", "study.antares", "-printf", "S:%h\\n", ")",
-        "-o",
-        "(", "-name", "AW_NO_SCAN", "-printf", "N:%h\\n", ")",
-    ]
-    # fmt: on
-
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300  # noqa: S603
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        logger.warning(f"find command failed, falling back to Python scan: {e}")
-        return _collect_studies_python(config)
-
-    if result.returncode > 1:
-        logger.warning(f"find exited with code {result.returncode}, falling back to Python scan")
-        return _collect_studies_python(config)
-
-    # Parse tagged output
-    study_paths: list[str] = []
-    noscan_dirs: set[str] = set()
-
-    for line in result.stdout.splitlines():
-        if line.startswith("S:"):
-            study_paths.append(line[2:])
-        elif line.startswith("N:"):
-            noscan_dirs.add(line[2:])
-
-    # Sort workspace roots longest-first so nested workspaces match correctly
-    sorted_roots = sorted(workspace_map.keys(), key=len, reverse=True)
-
-    studies: list[StudyFolder] = []
-    for study_path in study_paths:
-        # Check if under a no-scan directory
-        if noscan_dirs and any(study_path == ns or study_path.startswith(ns + "/") for ns in noscan_dirs):
-            continue
-
-        # Map to workspace and apply filter_in/filter_out
-        for root in sorted_roots:
-            if study_path == root or study_path.startswith(root + "/"):
-                ws_name, groups, c_in, c_out = workspace_map[root]
-                relative = study_path[len(root) :].lstrip("/")
-                if not relative or _passes_path_filters(relative, c_in, c_out):
-                    studies.append(StudyFolder(Path(study_path), ws_name, groups))
-                break
-
-    return studies
-
-
-def _passes_path_filters(
-    relative_path: str,
-    compiled_filter_in: list[re.Pattern],
-    compiled_filter_out: list[re.Pattern],
-) -> bool:
-    """Check that every path component passes filter_in/filter_out."""
-    for part in relative_path.split("/"):
-        if not any(p.search(part) for p in compiled_filter_in):
-            return False
-        if any(p.search(part) for p in compiled_filter_out):
-            return False
-        if part.startswith("~") and (
-            part.endswith(".thermal_timeseries_gen.tmp") or part.endswith(".upgrade.tmp")
-        ):
-            return False
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Python fallback (used when GNU find is not available)
-# ---------------------------------------------------------------------------
-
-
-def _collect_studies_python(config: Config) -> List[StudyFolder]:
-    """Queue-based parallel scanning fallback."""
+    """Queue-based parallel scan with mtime caching for incremental speedup."""
     scan_tasks: List[tuple[Path, str, List[Group], List[re.Pattern], List[re.Pattern]]] = []
     for name, workspace in config.storage.workspaces.items():
         if name != DEFAULT_WORKSPACE_NAME:
@@ -191,8 +95,12 @@ def _scan_single_dir(
     compiled_filter_out: List[re.Pattern],
 ) -> None | str | List[Path]:
     """
-    Scan a single directory in a single os.scandir() pass.
-    Returns None (ignored), "study" (found), or list of subdirectory Paths.
+    Scan a single directory with mtime-based caching.
+
+    1. Apply name filters (cheap, no I/O).
+    2. stat() the directory to get mtime_ns.
+    3. If mtime matches cache → return cached result (no readdir).
+    4. Otherwise → full os.scandir(), update cache.
     """
     try:
         name = path.name
@@ -207,18 +115,41 @@ def _scan_single_dir(
         ):
             return None
 
+        path_str = str(path)
+
+        # Check mtime to decide if we can use cached result
+        try:
+            current_mtime = os.stat(path).st_mtime_ns
+        except (PermissionError, OSError):
+            _dir_cache.pop(path_str, None)
+            return None
+
+        cached = _dir_cache.get(path_str)
+        if cached is not None and cached[0] == current_mtime:
+            # Cache hit: convert cached string paths back to Path objects
+            cached_result = cached[1]
+            if isinstance(cached_result, list):
+                return [Path(p) for p in cached_result]
+            return cached_result
+
+        # Cache miss: full scandir
         subdirs = []
         with os.scandir(path) as entries:
             for entry in entries:
                 if entry.name == "study.antares":
+                    _dir_cache[path_str] = (current_mtime, "study")
                     return "study"
                 if entry.name == "AW_NO_SCAN":
+                    _dir_cache[path_str] = (current_mtime, None)
                     return None
                 try:
                     if entry.is_dir():
                         subdirs.append(Path(entry.path))
                 except (PermissionError, OSError):
                     pass
+
+        # Cache the subdirectory list as strings (smaller, picklable)
+        _dir_cache[path_str] = (current_mtime, [str(s) for s in subdirs])
         return subdirs
 
     except Exception as e:
