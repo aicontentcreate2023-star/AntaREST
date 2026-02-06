@@ -62,85 +62,30 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
     results_queue: Queue = Queue()
     outstanding = 0
 
-    def _submit(ex: ThreadPoolExecutor, path: Path, ws_name: str, grps: List[Group], c_in: list, c_out: list) -> None:
-        nonlocal outstanding
-        future = ex.submit(_scan_single_dir, path, c_in, c_out)
-        metadata = (path, ws_name, grps, c_in, c_out)
-        future.add_done_callback(lambda f, m=metadata: results_queue.put((f, m)))
-        outstanding += 1
-
-    def _process_result(result: None | str | List[Path], dir_path: Path, ws_name: str, grps: List[Group], c_in: list, c_out: list, ex: ThreadPoolExecutor) -> None:
-        if result == "study":
-            studies.append(StudyFolder(dir_path, ws_name, grps))
-        elif isinstance(result, list):
-            for subdir in result:
-                # Try cache before submitting to thread pool
-                cached_result = _try_cache_hit(subdir, c_in, c_out)
-                if cached_result is _CACHE_MISS:
-                    _submit(ex, subdir, ws_name, grps, c_in, c_out)
-                else:
-                    _process_result(cached_result, subdir, ws_name, grps, c_in, c_out, ex)
-
     with ThreadPoolExecutor(max_workers=32) as executor:
         for root_path, workspace_name, groups, compiled_in, compiled_out in scan_tasks:
-            _submit(executor, root_path, workspace_name, groups, compiled_in, compiled_out)
+            future = executor.submit(_scan_single_dir, root_path, compiled_in, compiled_out)
+            metadata = (root_path, workspace_name, groups, compiled_in, compiled_out)
+            future.add_done_callback(lambda f, m=metadata: results_queue.put((f, m)))
+            outstanding += 1
 
         while outstanding > 0:
             done_future, (dir_path, ws_name, grps, c_in, c_out) = results_queue.get()
             outstanding -= 1
-
             try:
                 result = done_future.result()
-                _process_result(result, dir_path, ws_name, grps, c_in, c_out, executor)
+                if result == "study":
+                    studies.append(StudyFolder(dir_path, ws_name, grps))
+                elif isinstance(result, list):
+                    for subdir in result:
+                        f = executor.submit(_scan_single_dir, subdir, c_in, c_out)
+                        meta = (subdir, ws_name, grps, c_in, c_out)
+                        f.add_done_callback(lambda f2, m=meta: results_queue.put((f2, m)))
+                        outstanding += 1
             except Exception as e:
                 logger.error(f"Failed to scan dir {dir_path}", exc_info=e)
 
     return studies
-
-
-_CACHE_MISS = object()  # sentinel
-
-
-def _try_cache_hit(
-    path: Path,
-    compiled_filter_in: List[re.Pattern],
-    compiled_filter_out: List[re.Pattern],
-) -> object:
-    """
-    Try to resolve a directory from cache without any I/O.
-    Returns _CACHE_MISS if a stat()+scandir() is needed, otherwise the result.
-    """
-    name = path.name
-
-    if not any(p.search(name) for p in compiled_filter_in):
-        return None
-    if any(p.search(name) for p in compiled_filter_out):
-        return None
-    if name.startswith("~") and (
-        name.endswith(".thermal_timeseries_gen.tmp") or name.endswith(".upgrade.tmp")
-    ):
-        return None
-
-    path_str = str(path)
-    cached = _dir_cache.get(path_str)
-    if cached is None:
-        return _CACHE_MISS
-
-    # We have a cached entry, but need to verify mtime via stat().
-    # Do the stat here (still cheaper than scandir) and check.
-    try:
-        current_mtime = os.stat(path).st_mtime_ns
-    except (PermissionError, OSError):
-        _dir_cache.pop(path_str, None)
-        return None
-
-    if cached[0] == current_mtime:
-        cached_result = cached[1]
-        if isinstance(cached_result, list):
-            return [Path(p) for p in cached_result]
-        return cached_result
-
-    return _CACHE_MISS
 
 
 def _scan_single_dir(
