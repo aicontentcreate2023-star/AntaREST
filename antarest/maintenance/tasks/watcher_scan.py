@@ -34,6 +34,9 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
     """
     Collect studies from all workspaces (except default).
 
+    Each workspace is scanned with parallel subdirectory scanning
+    (threads are managed inside rec_scan_for_studies).
+
     Args:
         config: Application configuration.
 
@@ -45,7 +48,9 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
         if name != DEFAULT_WORKSPACE_NAME:
             path = Path(workspace.path)
             groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-            studies += rec_scan_for_studies(path, name, groups, workspace.filter_in, workspace.filter_out)
+            studies += rec_scan_for_studies(
+                path, name, groups, workspace.filter_in, workspace.filter_out, max_workers=8
+            )
     return studies
 
 

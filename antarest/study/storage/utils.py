@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Sequence, cast
@@ -451,6 +452,158 @@ def has_children(path: Path, filter_in: List[str], filter_out: List[str], show_h
     return False
 
 
+def _should_scan_dir(path: Path, compiled_in: List[re.Pattern[str]], compiled_out: List[re.Pattern[str]]) -> bool:
+    """
+    Check if a directory should be scanned based on name filters and markers.
+
+    Performs name-based checks only (no filesystem I/O).
+    The AW_NO_SCAN marker is checked separately during os.scandir() in _scan_recursive.
+    """
+    if is_temporary_upgrade_dir(path):
+        logger.info(f"Upgrade temporary folder found. Will skip further scan of folder {path}")
+        return False
+    name = path.name
+    if name.startswith(TS_GEN_PREFIX) and name.endswith(TS_GEN_SUFFIX):
+        logger.info(f"TS generation temporary folder found. Will skip further scan of folder {path}")
+        return False
+    if not any(p.search(name) for p in compiled_in):
+        return False
+    if any(p.search(name) for p in compiled_out):
+        return False
+    return True
+
+
+def _scan_recursive(
+    path: Path,
+    workspace: str,
+    groups: List[Group],
+    compiled_in: List[re.Pattern[str]],
+    compiled_out: List[re.Pattern[str]],
+    max_depth: Optional[int] = None,
+) -> List[StudyFolder]:
+    """
+    Scan a directory for studies using os.scandir() for optimal I/O.
+
+    Uses a single os.scandir() call per directory to both detect marker files
+    (study.antares, AW_NO_SCAN) and list subdirectories, instead of multiple
+    separate stat() calls.
+    """
+    try:
+        study_found = False
+        subdirs: List[os.DirEntry[str]] = []
+
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    name = entry.name
+                    if name == "AW_NO_SCAN":
+                        logger.info(f"No scan directive file found. Will skip further scan of folder {path}")
+                        return []
+                    if name == "study.antares":
+                        study_found = True
+                    elif entry.is_dir():
+                        subdirs.append(entry)
+        except (PermissionError, OSError) as e:
+            logger.warning(f"Cannot access {path}: {e}")
+            return []
+
+        if study_found:
+            logger.debug(f"Study {path.name} found in {workspace}")
+            return [StudyFolder(path, workspace, groups)]
+
+        if max_depth is not None and max_depth <= 0:
+            logger.info(f"Scan was configured to not go any deeper, max_depth: {max_depth}")
+            return []
+
+        child_max_depth = max_depth - 1 if max_depth is not None else None
+        studies: List[StudyFolder] = []
+        for entry in subdirs:
+            child_path = Path(entry.path)
+            if _should_scan_dir(child_path, compiled_in, compiled_out):
+                try:
+                    studies.extend(
+                        _scan_recursive(child_path, workspace, groups, compiled_in, compiled_out, child_max_depth)
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to scan dir {entry.path}", exc_info=e)
+
+        return studies
+    except Exception as e:
+        logger.error(f"Failed to scan dir {path}", exc_info=e)
+        return []
+
+
+def _scan_first_level_parallel(
+    path: Path,
+    workspace: str,
+    groups: List[Group],
+    compiled_in: List[re.Pattern[str]],
+    compiled_out: List[re.Pattern[str]],
+    max_depth: Optional[int],
+    max_workers: int,
+) -> List[StudyFolder]:
+    """
+    Scan root directory then parallelize subdirectory scanning using threads.
+
+    The root level is scanned to detect markers (study.antares, AW_NO_SCAN)
+    and collect subdirectories. Each eligible subdirectory is then scanned
+    in a separate thread for I/O parallelism.
+    """
+    try:
+        study_found = False
+        subdirs: List[os.DirEntry[str]] = []
+
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    name = entry.name
+                    if name == "AW_NO_SCAN":
+                        logger.info(f"No scan directive file found. Will skip further scan of folder {path}")
+                        return []
+                    if name == "study.antares":
+                        study_found = True
+                    elif entry.is_dir():
+                        subdirs.append(entry)
+        except (PermissionError, OSError) as e:
+            logger.warning(f"Cannot access {path}: {e}")
+            return []
+
+        if study_found:
+            logger.debug(f"Study {path.name} found in {workspace}")
+            return [StudyFolder(path, workspace, groups)]
+
+        if max_depth is not None and max_depth <= 0:
+            logger.info(f"Scan was configured to not go any deeper, max_depth: {max_depth}")
+            return []
+
+        child_max_depth = max_depth - 1 if max_depth is not None else None
+        eligible = [
+            Path(entry.path) for entry in subdirs if _should_scan_dir(Path(entry.path), compiled_in, compiled_out)
+        ]
+
+        if not eligible:
+            return []
+
+        studies: List[StudyFolder] = []
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(eligible))) as executor:
+            futures = {
+                executor.submit(
+                    _scan_recursive, child_path, workspace, groups, compiled_in, compiled_out, child_max_depth
+                ): child_path
+                for child_path in eligible
+            }
+            for future in as_completed(futures):
+                try:
+                    studies.extend(future.result())
+                except Exception as e:
+                    logger.error(f"Failed to scan dir {futures[future]}", exc_info=e)
+
+        return studies
+    except Exception as e:
+        logger.error(f"Failed to scan dir {path}", exc_info=e)
+        return []
+
+
 def rec_scan_for_studies(
     path: Path,
     workspace: str,
@@ -458,6 +611,7 @@ def rec_scan_for_studies(
     filter_in: List[str],
     filter_out: List[str],
     max_depth: Optional[int] = None,
+    max_workers: int = 16,
 ) -> List[StudyFolder]:
     """
     Recursively scan a directory for studies.
@@ -471,31 +625,19 @@ def rec_scan_for_studies(
         filter_in: Regex patterns for folders to include.
         filter_out: Regex patterns for folders to exclude.
         max_depth: Maximum depth to scan. None means unlimited.
+        max_workers: Number of threads for parallel scanning of first-level
+                     subdirectories. 1 means sequential (default).
 
     Returns:
         A list of StudyFolder objects representing found studies.
     """
-    try:
-        if should_ignore_folder_for_scan(path, filter_in, filter_out):
-            return []
+    compiled_in = [re.compile(r) for r in filter_in]
+    compiled_out = [re.compile(r) for r in filter_out]
 
-        if (path / "study.antares").exists():
-            logger.debug(f"Study {path.name} found in {workspace}")
-            return [StudyFolder(path, workspace, groups)]
-
-        if max_depth is not None and max_depth <= 0:
-            logger.info(f"Scan was configured to not go any deeper, max_depth: {max_depth}")
-            return []
-
-        folders: List[StudyFolder] = []
-        if path.is_dir():
-            for child in path.iterdir():
-                child_max_depth = max_depth - 1 if max_depth is not None else None
-                try:
-                    folders += rec_scan_for_studies(child, workspace, groups, filter_in, filter_out, child_max_depth)
-                except Exception as e:
-                    logger.error(f"Failed to scan dir {child}", exc_info=e)
-        return folders
-    except Exception as e:
-        logger.error(f"Failed to scan dir {path}", exc_info=e)
+    if not _should_scan_dir(path, compiled_in, compiled_out):
         return []
+
+    if max_workers > 1:
+        return _scan_first_level_parallel(path, workspace, groups, compiled_in, compiled_out, max_depth, max_workers)
+
+    return _scan_recursive(path, workspace, groups, compiled_in, compiled_out, max_depth)
