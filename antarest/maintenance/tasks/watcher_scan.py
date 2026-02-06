@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from pathlib import Path
 from typing import Any, List
@@ -43,30 +43,32 @@ def _collect_studies(config: Config) -> List[StudyFolder]:
     """Parallel BFS scan with mtime caching for incremental speedup."""
     studies: List[StudyFolder] = []
 
-    with ThreadPoolExecutor(max_workers=32) as executor:
-        pending: dict[Any, Any] = {}
-        for name, workspace in config.storage.workspaces.items():
-            if name == DEFAULT_WORKSPACE_NAME:
-                continue
-            root = Path(workspace.path)
-            groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-            filter_in = [re.compile(r) for r in workspace.filter_in]
-            filter_out = [re.compile(r) for r in workspace.filter_out]
-            f = executor.submit(_scan_dir, root, filter_in, filter_out)
-            pending[f] = (root, name, groups, filter_in, filter_out)
+    to_scan = []
+    for name, workspace in config.storage.workspaces.items():
+        if name == DEFAULT_WORKSPACE_NAME:
+            continue
+        root = Path(workspace.path)
+        groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
+        filter_in = [re.compile(r) for r in workspace.filter_in]
+        filter_out = [re.compile(r) for r in workspace.filter_out]
+        to_scan.append((root, name, groups, filter_in, filter_out))
 
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                path, ws_name, groups, f_in, f_out = pending.pop(future)
+    with ThreadPoolExecutor(max_workers=32) as executor:
+        while to_scan:
+            futures = {}
+            for path, ws_name, groups, f_in, f_out in to_scan:
+                f = executor.submit(_scan_dir, path, f_in, f_out)
+                futures[f] = (path, ws_name, groups, f_in, f_out)
+
+            to_scan = []
+            for future in as_completed(futures):
+                path, ws_name, groups, f_in, f_out = futures[future]
                 try:
                     result = future.result()
                     if result == "study":
                         studies.append(StudyFolder(path, ws_name, groups))
                     elif isinstance(result, list):
-                        for subdir in result:
-                            f = executor.submit(_scan_dir, subdir, f_in, f_out)
-                            pending[f] = (subdir, ws_name, groups, f_in, f_out)
+                        to_scan.extend((sub, ws_name, groups, f_in, f_out) for sub in result)
                 except Exception as e:
                     logger.error(f"Failed to scan dir {path}", exc_info=e)
 
