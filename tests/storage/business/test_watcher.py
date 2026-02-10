@@ -9,9 +9,7 @@
 # SPDX-License-Identifier: MPL-2.0
 #
 # This file is part of the Antares project.
-import logging
 import os
-import typing as t
 from datetime import timedelta
 from multiprocessing import Pool
 from pathlib import Path
@@ -32,6 +30,7 @@ from antarest.core.utils.fastapi_sqlalchemy import DBSessionMiddleware
 from antarest.core.utils.utils import current_time
 from antarest.login.model import GroupDTO
 from antarest.login.service import LoginService
+from antarest.maintenance.tasks.watcher_scan import _dir_cache
 from antarest.study.directory_service import DirectoryService
 from antarest.study.model import DEFAULT_WORKSPACE_NAME, OwnerInfo, Study, StudyMetadataDTO
 from antarest.study.repository import StudyMetadataRepository
@@ -41,6 +40,14 @@ from antarest.study.storage.rawstudy.watcher import Watcher
 from antarest.study.storage.variantstudy.variant_study_service import VariantStudyService
 from tests.helpers import create_study
 from tests.storage.conftest import SimpleSyncTaskService
+
+
+@pytest.fixture(autouse=True)
+def clear_dir_cache():
+    """Clear the mtime cache between tests to avoid side effects."""
+    _dir_cache.clear()
+    yield
+    _dir_cache.clear()
 
 
 def build_config(root: Path, desktop_mode: bool = False) -> Config:
@@ -257,7 +264,7 @@ def test_scan_recursive_false(study_tree: Path, db_session: Session) -> None:
         assert repository.delete.call_count == 1
 
 
-def test_partial_scan(tmp_path: Path, caplog: t.Any) -> None:
+def test_partial_scan(tmp_path: Path) -> None:
     engine = create_engine("sqlite:///:memory:", echo=False)
     Base.metadata.create_all(engine)
     # noinspection SpellCheckingInspection
@@ -299,31 +306,26 @@ def test_partial_scan(tmp_path: Path, caplog: t.Any) -> None:
     with pytest.raises(CannotAccessInternalWorkspace):
         watcher.scan(workspace_name="default", workspace_directory_path=default)
 
-    with caplog.at_level(level=logging.INFO, logger="antarest.study.storage.utils"):
-        # scan the `default` directory
-        watcher.scan(workspace_name="test", workspace_directory_path=default)
+    # scan the `test` directory
+    watcher.scan(workspace_name="test", workspace_directory_path=default)
 
-        # verify that only one study has been scanned
-        assert service.sync_studies_on_disk.call_count == 1
+    # verify that only one study has been scanned
+    assert service.sync_studies_on_disk.call_count == 1
 
-        # verify that the scan process has been called with the correct arguments
-        call = service.sync_studies_on_disk.call_args_list[0]
+    # verify that the scan process has been called with the correct arguments
+    call = service.sync_studies_on_disk.call_args_list[0]
 
-        # verify that only one study has been scanned
-        assert len(call.args[0]) == 1
+    # verify that only one study has been scanned (upgrade_folder and ts_gen_folder are skipped)
+    assert len(call.args[0]) == 1
 
-        # verify that folder `a` has been processed correctly
-        assert call.args[0][0].path == a
-        assert call.args[0][0].workspace == "test"
-        groups = call.args[0][0].groups
-        assert len(groups) == 1
-        assert groups[0].id == "toto"
-        assert groups[0].name == "toto"
-        assert call.args[1] == tmp_path / "test"
-
-    # verify that `upgrade_folder` and `ts_gen_folder`  have been skipped
-    assert f"Upgrade temporary folder found. Will skip further scan of folder {upgrade_folder}" in caplog.text
-    assert f"TS generation temporary folder found. Will skip further scan of folder {ts_gen_folder}" in caplog.text
+    # verify that folder `a` has been processed correctly
+    assert call.args[0][0].path == a
+    assert call.args[0][0].workspace == "test"
+    groups = call.args[0][0].groups
+    assert len(groups) == 1
+    assert groups[0].id == "toto"
+    assert groups[0].name == "toto"
+    assert call.args[1] == tmp_path / "test"
 
 
 def test_scan_disabled_exception(study_tree: Path) -> None:

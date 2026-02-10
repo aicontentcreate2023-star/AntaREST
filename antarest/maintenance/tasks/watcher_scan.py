@@ -39,36 +39,60 @@ logger = logging.getLogger(__name__)
 _dir_cache: dict[str, Any] = {}
 
 
-def _collect_studies(config: Config) -> List[StudyFolder]:
-    """Parallel BFS scan with mtime caching for incremental speedup."""
+def collect_studies(
+    config: Config,
+    workspace_name: str | None = None,
+    root_path: Path | None = None,
+    max_depth: int | None = None,
+) -> List[StudyFolder]:
+    """Parallel BFS scan with mtime caching for incremental speedup.
+
+    Args:
+        config: Application configuration.
+        workspace_name: If provided with root_path, scan only this workspace starting from root_path.
+        root_path: Starting directory for a partial scan (requires workspace_name).
+        max_depth: Maximum BFS depth. None means unlimited, 1 means direct children only.
+    """
     studies: List[StudyFolder] = []
 
-    to_scan = []
-    for name, workspace in config.storage.workspaces.items():
-        if name == DEFAULT_WORKSPACE_NAME:
-            continue
-        root = Path(workspace.path)
+    # to_scan entries: (path, ws_name, groups, filter_in, filter_out, depth)
+    to_scan: list[tuple[Path, str, list[Group], list[re.Pattern[str]], list[re.Pattern[str]], int]] = []
+
+    if workspace_name is not None and root_path is not None:
+        # Partial scan: single workspace from a specific root
+        workspace = config.storage.workspaces[workspace_name]
         groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
         filter_in = [re.compile(r) for r in workspace.filter_in]
         filter_out = [re.compile(r) for r in workspace.filter_out]
-        to_scan.append((root, name, groups, filter_in, filter_out))
+        to_scan.append((root_path, workspace_name, groups, filter_in, filter_out, 0))
+    else:
+        # Full scan: all workspaces (except default)
+        for name, workspace in config.storage.workspaces.items():
+            if name == DEFAULT_WORKSPACE_NAME:
+                continue
+            root = Path(workspace.path)
+            groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
+            filter_in = [re.compile(r) for r in workspace.filter_in]
+            filter_out = [re.compile(r) for r in workspace.filter_out]
+            to_scan.append((root, name, groups, filter_in, filter_out, 0))
 
     with ThreadPoolExecutor(max_workers=32) as executor:
         while to_scan:
             futures = {}
-            for path, ws_name, groups, f_in, f_out in to_scan:
+            for path, ws_name, groups, f_in, f_out, depth in to_scan:
                 f = executor.submit(_scan_dir, path, f_in, f_out)
-                futures[f] = (path, ws_name, groups, f_in, f_out)
+                futures[f] = (path, ws_name, groups, f_in, f_out, depth)
 
             to_scan = []
             for future in as_completed(futures):
-                path, ws_name, groups, f_in, f_out = futures[future]
+                path, ws_name, groups, f_in, f_out, depth = futures[future]
                 try:
                     result = future.result()
                     if result == "study":
                         studies.append(StudyFolder(path, ws_name, groups))
                     elif isinstance(result, list):
-                        to_scan.extend((sub, ws_name, groups, f_in, f_out) for sub in result)
+                        if max_depth is None or depth + 1 <= max_depth:
+                            to_scan.extend((sub, ws_name, groups, f_in, f_out, depth + 1) for sub in result)
                 except Exception as e:
                     logger.error(f"Failed to scan dir {path}", exc_info=e)
 
@@ -98,19 +122,24 @@ def _scan_dir(path: Path, filter_in: List[re.Pattern[str]], filter_out: List[re.
             return cached[1]
 
         subdirs = []
+        is_study = False
         with os.scandir(path) as entries:
             for entry in entries:
-                if entry.name == "study.antares":
-                    _dir_cache[key] = (mtime, "study")
-                    return "study"
                 if entry.name == "AW_NO_SCAN":
                     _dir_cache[key] = (mtime, None)
                     return None
+                if entry.name == "study.antares":
+                    is_study = True
+                    continue
                 try:
                     if entry.is_dir():
                         subdirs.append(Path(entry.path))
                 except (PermissionError, OSError):
                     pass
+
+        if is_study:
+            _dir_cache[key] = (mtime, "study")
+            return "study"
 
         _dir_cache[key] = (mtime, subdirs)
         return subdirs
@@ -144,7 +173,7 @@ def scan_workspaces(
     try:
         with db():
             with create_lock(db.session, lock_id=LockId.WATCHER_SCAN):
-                studies = _collect_studies(config)
+                studies = collect_studies(config)
                 studies_found = len(studies)
                 logger.info(f"Found {studies_found} studies across all workspaces")
 

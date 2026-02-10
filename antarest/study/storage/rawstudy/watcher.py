@@ -19,10 +19,9 @@ In production (Celery mode), use the watcher_scan_task instead.
 
 import logging
 import tempfile
-from html import escape
 from pathlib import Path
 from time import sleep, time
-from typing import List, Optional
+from typing import Optional
 
 from filelock import FileLock
 from typing_extensions import override
@@ -34,26 +33,14 @@ from antarest.core.tasks.model import TaskResult, TaskType
 from antarest.core.tasks.service import ITaskNotifier, ITaskService
 from antarest.core.utils.fastapi_sqlalchemy import db
 from antarest.core.utils.utils import StopWatch
-from antarest.login.model import Group
-from antarest.study.model import DEFAULT_WORKSPACE_NAME, StudyFolder
+from antarest.maintenance.tasks.watcher_scan import collect_studies
 from antarest.study.service import StudyService
 from antarest.study.storage.utils import (
     get_folder_from_workspace,
     get_workspace_from_config,
-    rec_scan_for_studies,
 )
 
 logger = logging.getLogger(__name__)
-
-
-class _LogScanDuration:
-    """Functional object use to log the scanning duration of a workspace."""
-
-    def __init__(self, workspace_name: str) -> None:
-        self.workspace_name = workspace_name
-
-    def __call__(self, duration: float) -> None:
-        logger.info(f"Workspace {self.workspace_name} scanned in {duration}s")
 
 
 class Watcher(IService):
@@ -182,29 +169,18 @@ class Watcher(IService):
             raise ScanDisabled("Recursive scan disables when desktop mode is on")
 
         stopwatch = StopWatch()
-        studies: List[StudyFolder] = list()
         directory_path: Optional[Path] = None
 
-        # max depth when we call rec_scan_for_studies
         max_depth = None if recursive else 1
 
         if workspace_directory_path is not None and workspace_name:
             workspace = get_workspace_from_config(self.config, workspace_name)
             directory_path = get_folder_from_workspace(workspace, workspace_directory_path)
-
-            groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-            studies = rec_scan_for_studies(
-                directory_path, workspace_name, groups, workspace.filter_in, workspace.filter_out, max_depth=max_depth
+            studies = collect_studies(
+                self.config, workspace_name=workspace_name, root_path=directory_path, max_depth=max_depth
             )
         elif workspace_directory_path is None and workspace_name is None:
-            for name, workspace in self.config.storage.workspaces.items():
-                if name != DEFAULT_WORKSPACE_NAME:
-                    path = Path(workspace.path)
-                    groups = [Group(id=escape(g), name=escape(g)) for g in workspace.groups]
-                    studies = studies + rec_scan_for_studies(
-                        path, name, groups, workspace.filter_in, workspace.filter_out, max_depth=max_depth
-                    )
-                    stopwatch.log_elapsed(_LogScanDuration(name))
+            studies = collect_studies(self.config, max_depth=max_depth)
         else:
             raise ValueError("Both workspace_name and directory_path must be specified")
         with db():

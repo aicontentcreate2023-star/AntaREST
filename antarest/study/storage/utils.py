@@ -47,7 +47,6 @@ from antarest.core.serde.ini_reader import IniReader
 from antarest.core.serde.ini_writer import IniWriter
 from antarest.core.utils.archives import is_archive_format
 from antarest.core.utils.utils import StopWatch
-from antarest.login.model import Group
 from antarest.login.utils import require_current_user
 from antarest.study.model import (
     DEFAULT_WORKSPACE_NAME,
@@ -56,7 +55,6 @@ from antarest.study.model import (
     MatrixFrequency,
     MatrixIndex,
     Study,
-    StudyFolder,
     StudyMetadataDTO,
 )
 from antarest.study.storage.rawstudy.model.filesystem.config.model import Mode
@@ -472,67 +470,3 @@ def has_children(path: Path, filter_in: List[str], filter_out: List[str], show_h
             except (PermissionError, OSError):
                 logger.warning(f"tried to run is_non_study_folder on {entry.path} but no permission")
     return False
-
-
-def rec_scan_for_studies(
-    path: Path,
-    workspace: str,
-    groups: List[Group],
-    filter_in: List[str],
-    filter_out: List[str],
-    max_depth: Optional[int] = None,
-    _is_dir_cached: Optional[bool] = None,
-) -> List[StudyFolder]:
-    """
-    Recursively scan a directory for studies.
-
-    A study is identified by the presence of a "study.antares" file.
-
-    Args:
-        path: The directory path to scan.
-        workspace: The workspace name.
-        groups: The groups to associate with found studies.
-        filter_in: Regex patterns for folders to include.
-        filter_out: Regex patterns for folders to exclude.
-        max_depth: Maximum depth to scan. None means unlimited.
-        _is_dir_cached: Internal param - cached is_dir result from os.scandir().
-
-    Returns:
-        A list of StudyFolder objects representing found studies.
-    """
-    try:
-        if should_ignore_folder_for_scan(path, filter_in, filter_out, is_dir_cached=_is_dir_cached):
-            return []
-
-        if (path / "study.antares").exists():
-            logger.debug(f"Study {path.name} found in {workspace}")
-            return [StudyFolder(path, workspace, groups)]
-
-        if max_depth is not None and max_depth <= 0:
-            logger.info(f"Scan was configured to not go any deeper, max_depth: {max_depth}")
-            return []
-
-        folders: List[StudyFolder] = []
-        # Use os.scandir() for better performance - DirEntry caches is_dir() result
-        with os.scandir(path) as entries:
-            for entry in entries:
-                child_max_depth = max_depth - 1 if max_depth is not None else None
-                try:
-                    # entry.is_dir() uses cached stat info from scandir (no extra syscall)
-                    child_is_dir = entry.is_dir()
-                    if child_is_dir:
-                        folders += rec_scan_for_studies(
-                            Path(entry.path),
-                            workspace,
-                            groups,
-                            filter_in,
-                            filter_out,
-                            child_max_depth,
-                            _is_dir_cached=child_is_dir,
-                        )
-                except Exception as e:
-                    logger.error(f"Failed to scan dir {entry.path}", exc_info=e)
-        return folders
-    except Exception as e:
-        logger.error(f"Failed to scan dir {path}", exc_info=e)
-        return []
